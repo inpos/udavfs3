@@ -66,9 +66,9 @@ class Operations(llfuse.Operations):
             uid       INT NOT NULL,
             gid       INT NOT NULL,
             mode      INT NOT NULL,
-            mtime     FLOAT NOT NULL,
-            atime     FLOAT NOT NULL,
-            ctime     FLOAT NOT NULL,
+            mtime     BIGINT NOT NULL,
+            atime     BIGINT NOT NULL,
+            ctime     BIGINT NOT NULL,
             target    BYTEA,
             size      BIGINT NOT NULL DEFAULT 0,
             rdev      INT NOT NULL DEFAULT 0,
@@ -111,8 +111,8 @@ class Operations(llfuse.Operations):
                             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                             (self.fsid, llfuse.ROOT_INODE, stat.S_IFDIR | stat.S_IRUSR | stat.S_IWUSR
                               | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH 
-                              | stat.S_IXOTH, os.getuid(), os.getgid(), time(), 
-                              time(), time()))
+                              | stat.S_IXOTH, os.getuid(), os.getgid(), int(time() * 1e9), 
+                              int(time() * 1e9), int(time() * 1e9)))
         self.cursor.execute("SELECT setval('inodes_inode_id_seq', %s);", (llfuse.ROOT_INODE + 1,))
         self.cursor.execute("INSERT INTO contents (fsid, name, parent_inode, inode_id) VALUES (%s,%s,%s,%s)",
                             (self.fsid, b'..', llfuse.ROOT_INODE, llfuse.ROOT_INODE))
@@ -129,7 +129,7 @@ class Operations(llfuse.Operations):
 
         return row
                     
-    def lookup(self, inode_p, name):
+    def lookup(self, inode_p, name, ctx):
         if name == b'.':
             inode = inode_p
         elif name == b'..':
@@ -142,9 +142,9 @@ class Operations(llfuse.Operations):
             except NoSuchRowError:
                 raise(llfuse.FUSEError(errno.ENOENT))
         
-        return self.getattr(inode)
+        return self.getattr(inode, ctx)
         
-    def getattr(self, inode):
+    def getattr(self, inode, ctx = None):
         cur = self.db.cursor(cursor_factory=psycopg2.extras.DictCursor)
         cur.execute('SELECT * FROM inodes WHERE inode_id=%s AND fsid=%s', (inode, self.fsid))
         row = cur.fetchone()
@@ -164,16 +164,16 @@ class Operations(llfuse.Operations):
         entry.st_blksize = self.blocksize
         entry.st_blocks = self.get_row("SELECT COUNT(1) FROM body WHERE inode_id=%s AND fsid=%s",
                                      (inode, self.fsid))[0]
-        entry.st_atime = row['atime']                          
-        entry.st_mtime = row['mtime']
-        entry.st_ctime = row['ctime']
+        entry.st_atime_ns = row['atime']                          
+        entry.st_mtime_ns = row['mtime']
+        entry.st_ctime_ns = row['ctime']
         
         return entry
 
-    def readlink(self, inode):
+    def readlink(self, inode, ctx):
         return bytes(self.get_row('SELECT target FROM inodes WHERE inode_id=%s AND fsid=%s', (inode, self.fsid))[0])
     
-    def opendir(self, inode):
+    def opendir(self, inode, ctx):
         return inode
 
     def readdir(self, inode, off):
@@ -187,16 +187,16 @@ class Operations(llfuse.Operations):
         for row in cursor2.fetchall():
             yield (bytes(row['name']), self.getattr(row['inode_id']), row['rowid'])
 
-    def unlink(self, inode_p, name):
-        entry = self.lookup(inode_p, name)
+    def unlink(self, inode_p, name, ctx):
+        entry = self.lookup(inode_p, name, ctx)
 
         if stat.S_ISDIR(entry.st_mode):
             raise llfuse.FUSEError(errno.EISDIR)
 
         self._remove(inode_p, name, entry)
 
-    def rmdir(self, inode_p, name):
-        entry = self.lookup(inode_p, name)
+    def rmdir(self, inode_p, name, ctx):
+        entry = self.lookup(inode_p, name, ctx)
 
         if not stat.S_ISDIR(entry.st_mode):
             raise llfuse.FUSEError(errno.ENOTDIR)
@@ -221,11 +221,11 @@ class Operations(llfuse.Operations):
                 stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH)
         return self._create(inode_p, name, mode, ctx, target=target)
 
-    def rename(self, inode_p_old, name_old, inode_p_new, name_new):
-        entry_old = self.lookup(inode_p_old, name_old)
+    def rename(self, inode_p_old, name_old, inode_p_new, name_new, ctx):
+        entry_old = self.lookup(inode_p_old, name_old, ctx)
 
         try:
-            entry_new = self.lookup(inode_p_new, name_new)
+            entry_new = self.lookup(inode_p_new, name_new, ctx)
         except llfuse.FUSEError as exc:
             if exc.errno != errno.ENOENT:
                 raise
@@ -257,21 +257,21 @@ class Operations(llfuse.Operations):
             self.cursor.execute("DELETE FROM inodes WHERE inode_id=%s AND fsid=%s", (entry_new.st_ino, self.fsid))
         
 
-    def link(self, inode, new_inode_p, new_name):
-        entry_p = self.getattr(new_inode_p)
+    def link(self, inode, new_inode_p, new_name, ctx):
+        entry_p = self.getattr(new_inode_p, ctx)
         if entry_p.st_nlink == 0:
             raise FUSEError(errno.EINVAL)
 
         self.cursor.execute("INSERT INTO contents (name, inode_id, parent_inode, fsid) VALUES(%s,%s,%s,%s)",
                             (new_name, inode, new_inode_p, self.fsid))
         
-        return self.getattr(inode)
+        return self.getattr(inode, ctx)
     def del_block(self, inode, num):
         self.cursor.execute("DELETE FROM body WHERE inode_id=%s AND block_no=%s AND fsid=%s", (inode, num, self.fsid))
 
-    def setattr(self, inode, attr):
+    def setattr(self, inode, attr, fields, fh, ctx):
 
-        if attr.st_size is not None:
+        if fields.update_size:
             size = self.get_row('SELECT size FROM inodes WHERE inode_id=%s AND fsid=%s', (inode, self.fsid))[0]
             if size is None:
                 size = 0
@@ -314,15 +314,15 @@ class Operations(llfuse.Operations):
             else:
                 self.cursor.execute("UPDATE inodes SET size=%s WHERE inode_id=%s AND fsid=%s",
                                 (attr.st_size, inode, self.fsid))
-        if attr.st_mode is not None:
+        if fields.update_mode:
             self.cursor.execute('UPDATE inodes SET mode=%s WHERE inode_id=%s AND fsid=%s',
                                 (attr.st_mode, inode, self.fsid))
 
-        if attr.st_uid is not None:
+        if fields.update_uid:
             self.cursor.execute('UPDATE inodes SET uid=%s WHERE inode_id=%s AND fsid=%s',
                                 (attr.st_uid, inode, self.fsid))
 
-        if attr.st_gid is not None:
+        if fields.update_gid:
             self.cursor.execute('UPDATE inodes SET gid=%s WHERE inode_id=%s AND fsid=%s',
                                 (attr.st_gid, inode, self.fsid))
 
@@ -330,19 +330,19 @@ class Operations(llfuse.Operations):
             self.cursor.execute('UPDATE inodes SET rdev=%s WHERE inode_id=%s AND fsid=%s',
                                 (attr.st_rdev, inode, self.fsid))
 
-        if attr.st_atime is not None:
+        if fields.update_atime:
             self.cursor.execute('UPDATE inodes SET atime=%s WHERE inode_id=%s AND fsid=%s',
-                                (attr.st_atime, inode, self.fsid))
+                                (attr.st_atime_ns, inode, self.fsid))
 
-        if attr.st_mtime is not None:
+        if fields.update_mtime:
             self.cursor.execute('UPDATE inodes SET mtime=%s WHERE inode_id=%s AND fsid=%s',
-                                (attr.st_mtime, inode, self.fsid))
+                                (attr.st_mtime_ns, inode, self.fsid))
 
-        if attr.st_ctime is not None:
+        if attr.st_ctime_ns is not None:
             self.cursor.execute('UPDATE inodes SET ctime=%s WHERE inode_id=%s AND fsid=%s',
-                                (attr.st_ctime, inode, self.fsid))
+                                (attr.st_ctime_ns, inode, self.fsid))
         
-        return self.getattr(inode)
+        return self.getattr(inode, ctx)
 
     def mknod(self, inode_p, name, mode, rdev, ctx):
         return self._create(inode_p, name, mode, ctx, rdev=rdev)
@@ -350,7 +350,7 @@ class Operations(llfuse.Operations):
     def mkdir(self, inode_p, name, mode, ctx):
         return self._create(inode_p, name, mode, ctx)
 
-    def statfs(self):
+    def statfs(self, ctx):
         stat_ = llfuse.StatvfsData()
 
         stat_.f_bsize = self.blocksize
@@ -368,11 +368,11 @@ class Operations(llfuse.Operations):
 
         return stat_
 
-    def open(self, inode, flags):
+    def open(self, inode, flags, ctx):
         self.inode_open_count[inode] += 1
         return inode
 
-    def access(self, inode, mode, ctx):
+    def access(self, inode, mode, ctx=None):
         if mode != os.F_OK and not self.__access(inode, mode, ctx):
             return False
         return True
@@ -396,18 +396,18 @@ class Operations(llfuse.Operations):
         return (entry.st_ino, entry)
 
     def _create(self, inode_p, name, mode, ctx, rdev=0, target=None):             
-        if self.getattr(inode_p).st_nlink == 0:
+        if self.getattr(inode_p, ctx).st_nlink == 0:
             raise FUSEError(errno.EINVAL)
 
         self.cursor.execute('INSERT INTO inodes (uid, gid, mode, mtime, atime, '
                             'ctime, target, rdev, fsid) VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING inode_id;',
-                            (ctx.uid, ctx.gid, mode, time(), time(), time(), target, rdev, self.fsid))
+                            (ctx.uid, ctx.gid, mode, int(time() * 1e9), int(time() * 1e9), int(time() * 1e9), target, rdev, self.fsid))
 
         inode = self.cursor.fetchone()[0]
         self.cursor.execute("INSERT INTO contents(name, inode_id, parent_inode, fsid) VALUES(%s,%s,%s,%s);",
                         (name, inode, inode_p, self.fsid))
         
-        return self.getattr(inode)
+        return self.getattr(inode, ctx)
 
     def block_info(self, offset, length):
         info = {}
@@ -502,38 +502,40 @@ class NoSuchRowError(Exception):
 
 def usage():
     raise SystemExit('''\
-Usage: %s "host=dbhost dbname=database user=dbuser password=dbpass" <mountpoint> [-o mount_options]
+Usage: %s "host=dbhost dbname=database user=dbuser password=dbpass" <mountpoint> -o mount_options
 UdavFS mount_option:
     fsid=<uniq_string>
-    blocksize=<bytes>
-    fssize=<size>[k|m|g|t]
+    [locksize=<bytes>
+    fssize=<size>[k|m|g|t] ]
 
 Option 'user_allow_other' MUST be set in /etc/fuse.conf''' % sys.argv[0])
 
 if __name__ == '__main__':
     
-    if len(sys.argv) < 3 or len(sys.argv) > 3 and len(sys.argv) < 5 or len(sys.argv) > 5:
+    if len(sys.argv) != 5:
         usage()
-    if sys.argv[3] != '-o' and len(sys.argv) != 5:
+    if sys.argv[3] != '-o':
         usage()
-    conn_str = sys.argv[1]
+    conn_str = sys.argv[1] + ' sslmode=\'require\''
     options = {x.split('=')[0].strip(): len(x.split('=')) > 1 and x.split('=')[1].strip() or True for x in sys.argv[4].split(',') }
     
     db = psycopg2.connect(conn_str)
     db.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cursor = db.cursor()
     
+    if 'fsname' not in options.keys():
+        print('fsname MUST be in mountoptions\n')
+        usage()
+    fsname = options['fsname']
+    del options['fsname']
+    fsid = sha1(bytes(fsname.strip(), 'UTF-8')).hexdigest()
+    
     try:
-        cursor.execute('SELECT fsid, bs, size FROM fsinfo WHERE fsid=%s', (fsid,))
-        fsid, blocksize, fssize = cursor.fetchone()
+        cursor.execute('SELECT bs, size FROM fsinfo WHERE fsid=%s', (fsid,))
+        blocksize, fssize = cursor.fetchone()
+        if options['fssize']: del options['fssize']
+        if options['blocksize']: del options['blocksize']
     except:
-        if 'fsid' not in options.keys():
-            print('fsid MUST be in mountoptions\n')
-            usage()
-        fsname = options['fsid']
-        del options['fsid']
-        fsid = sha1(bytes(fsname.strip(), 'UTF-8')).hexdigest()
-
         if 'blocksize' not in options.keys():
             print('blocksize mountoption MUST be specified\n')
             usage()
@@ -593,12 +595,11 @@ if __name__ == '__main__':
 
 
     operations = Operations(conn_str, fsid, blocksize, fssize)
-    llfuse.init(operations, mountpoint, 
-                m_params)
+    llfuse.init(operations, mountpoint, m_params)
 
     
     try:
-        llfuse.main(single=False)
+        llfuse.main(workers=None)
     except:
         llfuse.close(unmount=False)
         raise
