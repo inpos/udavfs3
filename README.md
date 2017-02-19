@@ -15,6 +15,7 @@ chmod +x /usr/local/bin/udavfs3
 ```
 
 Вручную монтируем следующей командой:
+
 `udavfs3 "host=srv_hostname dbname=fs_db user=fs_user password=fs_user_password" /mount/point/path [-o mount_options]`
 
 mount_options имеют смысл только для вновь созданной базы данных.
