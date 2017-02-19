@@ -5,6 +5,7 @@
 # UdavFS mount_option:
 #    blocksize=<bytes>
 #    fssize=<size>[k|m|g|t]
+#    fsid=<uniq_name>
 #
 # Option 'user_allow_other' MUST be set in /etc/fuse.conf
 
@@ -500,7 +501,14 @@ class NoSuchRowError(Exception):
         return 'Query produced 0 result rows'
 
 def usage():
-    raise SystemExit('Usage: %s "host=dbhost dbname=database user=dbuser password=dbpass" <mountpoint> [-o mount_options]\nUdavFS mount_option:\n\tblocksize=<bytes>\n\tfssize=<size>[k|m|g|t]\n\nOption \'user_allow_other\' MUST be set in /etc/fuse.conf' % sys.argv[0])
+    raise SystemExit('''\
+Usage: %s "host=dbhost dbname=database user=dbuser password=dbpass" <mountpoint> [-o mount_options]
+UdavFS mount_option:
+    fsid=<uniq_string>
+    blocksize=<bytes>
+    fssize=<size>[k|m|g|t]
+
+Option 'user_allow_other' MUST be set in /etc/fuse.conf''' % sys.argv[0])
 
 if __name__ == '__main__':
     
@@ -510,25 +518,22 @@ if __name__ == '__main__':
         usage()
     conn_str = sys.argv[1]
     options = {x.split('=')[0].strip(): len(x.split('=')) > 1 and x.split('=')[1].strip() or True for x in sys.argv[4].split(',') }
-    if 'fsname' not in options.keys():
-        print('fsname MUST be in mountoptions\n')
-        usage()
-    fsname = options['fsname']
-    del options['fsname']
-    fsid = sha1(bytes(fsname.strip(), 'UTF-8')).hexdigest()
     
     db = psycopg2.connect(conn_str)
     db.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cursor = db.cursor()
     
     try:
-        cursor.execute('SELECT bs, size FROM fsinfo WHERE fsid=%s', (fsid,))
-        blocksize, fssize = cursor.fetchone()
+        cursor.execute('SELECT fsid, bs, size FROM fsinfo WHERE fsid=%s', (fsid,))
+        fsid, blocksize, fssize = cursor.fetchone()
     except:
-        if 'create' not in options.keys():
-            print('Filesystem "%s" does not exist\n' % (fsname,))
+        if 'fsid' not in options.keys():
+            print('fsid MUST be in mountoptions\n')
             usage()
-        del options['create']
+        fsname = options['fsid']
+        del options['fsid']
+        fsid = sha1(bytes(fsname.strip(), 'UTF-8')).hexdigest()
+
         if 'blocksize' not in options.keys():
             print('blocksize mountoption MUST be specified\n')
             usage()
@@ -541,7 +546,7 @@ if __name__ == '__main__':
         mod1 = {'k': 1024, 'm': 1024 ** 2, 'g': 1024 ** 3, 't': 1024 ** 4}
         fssize = options['fssize'].lower()
         del options['fssize']
-        if fssize[-1] in mod1.keys():
+        if fssize[-1].lower() in mod1.keys():
             fssize = math.ceil((int(fssize[:-1]) * mod1[fssize[-1]]) / blocksize) * blocksize
         if fssize < 4194304:
             raise SystemExit('Filesystem size less than 4MB.\n')
@@ -549,7 +554,7 @@ if __name__ == '__main__':
     db.close()
     del db
     
-    m_params = [  'fsname=udavfs', 'nonempty', 'default_permissions', 'allow_other' ]
+    m_params = [  'fsname=udavfs3', 'nonempty', 'default_permissions', 'allow_other' ]
     m_params.extend(options)
     mountpoint = os.path.abspath(sys.argv[2])
     
